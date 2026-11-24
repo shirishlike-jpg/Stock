@@ -8,15 +8,15 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 st.set_page_config(
-    page_title="NSE EOD CCI 200 + Daily R1 Screener",
+    page_title="NSE EOD Monthly R1 Breakout Screener",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("NSE EOD CCI 200 + Traditional Daily Pivot R1 Screener")
+st.title("NSE EOD Monthly R1 Breakout Screener")
 st.caption(
-    "EOD scanner | Traditional / Classic pivots | Explicit DAILY pivot timeframe | "
-    "CCI(14) cross above 200 | Close cross above daily R1 | Change 0% to +3%"
+    "Cash-market EOD scanner | Previous completed month's Traditional R1 | "
+    "EMA 20/50 | RSI 14 | Volume SMA 5"
 )
 
 NIFTY_URLS = {
@@ -47,131 +47,169 @@ def get_nse_symbols(universe: str) -> list[str]:
 def normalize_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty:
         return pd.DataFrame()
+
     data = raw.copy()
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
+
     data.columns = [str(c).strip().title() for c in data.columns]
     required = ["Open", "High", "Low", "Close", "Volume"]
     if not set(required).issubset(data.columns):
         return pd.DataFrame()
+
     data = data[required].apply(pd.to_numeric, errors="coerce")
-    data = data.dropna(subset=["High", "Low", "Close"])
+    data = data.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
     data = data[
-        (data["Close"] > 0)
+        (data["Open"] > 0)
+        & (data["Close"] > 0)
         & (data["High"] >= data["Low"])
+        & (data["High"] >= data["Open"])
         & (data["High"] >= data["Close"])
+        & (data["Low"] <= data["Open"])
         & (data["Low"] <= data["Close"])
     ]
-    return data[~data.index.duplicated(keep="last")].sort_index()
+    data = data[~data.index.duplicated(keep="last")].sort_index()
+
+    # Use timezone-naive dates after converting Yahoo timestamps to India time.
+    idx = pd.to_datetime(data.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    data.index = idx.normalize()
+    return data
 
 
-def calculate_cci(data: pd.DataFrame, period: int = 14) -> pd.Series:
-    typical = (data["High"] + data["Low"] + data["Close"]) / 3.0
-    sma = typical.rolling(period, min_periods=period).mean()
-    mean_deviation = typical.rolling(period, min_periods=period).apply(
-        lambda values: np.mean(np.abs(values - np.mean(values))),
-        raw=True,
-    )
-    result = (typical - sma) / (0.015 * mean_deviation)
-    return result.replace([np.inf, -np.inf], np.nan)
+def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Wilder's RSI (RMA smoothing), matching the common charting convention.
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
+    return rsi
 
 
-def add_daily_traditional_pivots(data: pd.DataFrame) -> pd.DataFrame:
+def add_previous_month_r1(data: pd.DataFrame) -> pd.DataFrame:
     """
-    Explicit DAILY Traditional/Classic pivots.
+    For every daily candle in a calendar month, calculate R1 from the
+    immediately preceding COMPLETED calendar month's H/L/C.
 
-    For trading session t, use the immediately preceding trading
-    session's H/L/C:
-        Pivot_t = (H_(t-1) + L_(t-1) + C_(t-1)) / 3
-        R1_t = 2 * Pivot_t - L_(t-1)
-
-    This intentionally does NOT use TradingView's Auto timeframe.
-    On some chart/timeframe combinations, Auto can resolve to weekly
-    pivots. This scanner explicitly uses daily pivot periods.
+    Monthly Pivot = (Previous Month High + Low + Close) / 3
+    Monthly R1 = 2 * Monthly Pivot - Previous Month Low
     """
     df = data.copy()
-    previous_pivot = (
-        df["High"].shift(1)
-        + df["Low"].shift(1)
-        + df["Close"].shift(1)
-    ) / 3.0
+    month_key = df.index.to_period("M")
 
-    df["Daily_Pivot"] = previous_pivot
-    df["Daily_R1"] = 2.0 * previous_pivot - df["Low"].shift(1)
-    df["Prior_Session_Daily_R1"] = df["Daily_R1"].shift(1)
+    monthly = df.resample("ME").agg(
+        {"High": "max", "Low": "min", "Close": "last"}
+    ).dropna()
+
+    monthly["Monthly_Pivot"] = (
+        monthly["High"] + monthly["Low"] + monthly["Close"]
+    ) / 3.0
+    monthly["Monthly_R1"] = 2.0 * monthly["Monthly_Pivot"] - monthly["Low"]
+
+    # Shift one completed monthly value forward, then map it to daily rows.
+    monthly["R1_For_Next_Month"] = monthly["Monthly_R1"].shift(1)
+    monthly.index = monthly.index.to_period("M")
+    r1_map = monthly["R1_For_Next_Month"]
+    df["Monthly_R1"] = month_key.map(r1_map.to_dict())
     return df
 
 
 def analyze_stock(symbol: str, raw: pd.DataFrame) -> dict | None:
     df = normalize_ohlcv(raw)
-    if len(df) < 35:
+    if len(df) < 70:
         return None
 
-    df["CCI_14"] = calculate_cci(df, 14)
-    df = add_daily_traditional_pivots(df)
+    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False, min_periods=20).mean()
+    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False, min_periods=50).mean()
+    df["RSI_14"] = calculate_rsi(df["Close"], 14)
+    df["Volume_SMA_5"] = df["Volume"].rolling(5, min_periods=5).mean()
+    df = add_previous_month_r1(df)
 
     df["Change_Percent"] = (
-        (df["Close"] - df["Close"].shift(1))
-        / df["Close"].shift(1)
+        (df["Close"] - df["Close"].shift(1)) / df["Close"].shift(1)
     ) * 100.0
 
-    # Condition 1: CCI crosses from <= 200 to > 200.
-    df["CCI_Cross"] = (
-        (df["CCI_14"].shift(1) <= 200)
-        & (df["CCI_14"] > 200)
+    # User's updated screener conditions.
+    df["High_Above_Prior_High"] = df["High"] > df["High"].shift(1)
+    df["Bullish_Candle"] = df["Close"] > df["Open"]
+    df["Close_Above_EMA20"] = df["Close"] > df["EMA_20"]
+    df["Close_Above_EMA50"] = df["Close"] > df["EMA_50"]
+    df["Change_Above_2_Percent"] = df["Change_Percent"] > 2.0
+    df["Volume_Above_SMA5"] = df["Volume"] > df["Volume_SMA_5"]
+    df["RSI_Above_65"] = df["RSI_14"] > 65.0
+    df["Close_Above_Monthly_R1"] = df["Close"] > df["Monthly_R1"]
+
+    # Yesterday's close must be at/below the same current-month R1 level.
+    df["Prior_Close_Below_Monthly_R1"] = (
+        df["Close"].shift(1) <= df["Monthly_R1"]
     )
 
-    # Condition 2: close crosses above the daily R1 series.
-    # Yesterday's close is compared with yesterday's daily R1;
-    # today's close is compared with today's daily R1.
-    df["R1_Cross"] = (
-        (df["Close"].shift(1) <= df["Prior_Session_Daily_R1"])
-        & (df["Close"] > df["Daily_R1"])
-    )
-
-    # Condition 3: daily close-to-close return in [0%, +3%].
-    df["Price_Condition"] = df["Change_Percent"].between(
-        0.0, 3.0, inclusive="both"
-    )
-
-    df["BUY_SIGNAL"] = (
-        df["CCI_Cross"] & df["R1_Cross"] & df["Price_Condition"]
-    )
+    condition_columns = [
+        "High_Above_Prior_High",
+        "Bullish_Candle",
+        "Close_Above_EMA20",
+        "Close_Above_EMA50",
+        "Change_Above_2_Percent",
+        "Volume_Above_SMA5",
+        "RSI_Above_65",
+        "Close_Above_Monthly_R1",
+        "Prior_Close_Below_Monthly_R1",
+    ]
+    df["BUY_SIGNAL"] = df[condition_columns].all(axis=1)
 
     latest = df.iloc[-1]
     previous = df.iloc[-2]
 
-    needed = [
-        latest["CCI_14"],
-        latest["Daily_Pivot"],
-        latest["Daily_R1"],
-        latest["Prior_Session_Daily_R1"],
+    required_values = [
+        latest["EMA_20"],
+        latest["EMA_50"],
+        latest["RSI_14"],
+        latest["Volume_SMA_5"],
+        latest["Monthly_R1"],
         latest["Change_Percent"],
     ]
-    if any(pd.isna(v) for v in needed):
+    if any(pd.isna(value) for value in required_values):
         return None
 
     candle_date = pd.Timestamp(df.index[-1])
-    if candle_date.tzinfo is not None:
-        candle_date = candle_date.tz_convert("Asia/Kolkata").tz_localize(None)
-
     return {
         "Symbol": symbol,
         "Candle Date": candle_date.strftime("%Y-%m-%d"),
         "Previous Close": round(float(previous["Close"]), 2),
+        "Latest Open": round(float(latest["Open"]), 2),
+        "Latest High": round(float(latest["High"]), 2),
+        "Latest Low": round(float(latest["Low"]), 2),
         "Latest Close": round(float(latest["Close"]), 2),
         "Change %": round(float(latest["Change_Percent"]), 2),
-        "CCI 14": round(float(latest["CCI_14"]), 2),
         "Previous Day High": round(float(previous["High"]), 2),
-        "Previous Day Low": round(float(previous["Low"]), 2),
-        "Previous Day Close": round(float(previous["Close"]), 2),
-        "Today's Daily Pivot": round(float(latest["Daily_Pivot"]), 2),
-        "Today's Daily R1": round(float(latest["Daily_R1"]), 2),
-        "Previous Session Daily R1": round(float(latest["Prior_Session_Daily_R1"]), 2),
-        "Close - Today's R1": round(float(latest["Close"] - latest["Daily_R1"]), 2),
-        "CCI Cross Above 200": bool(latest["CCI_Cross"]),
-        "Close Cross Above Daily R1": bool(latest["R1_Cross"]),
-        "Change 0% to 3%": bool(latest["Price_Condition"]),
+        "EMA 20": round(float(latest["EMA_20"]), 2),
+        "EMA 50": round(float(latest["EMA_50"]), 2),
+        "Volume": int(latest["Volume"]),
+        "Volume SMA 5": round(float(latest["Volume_SMA_5"]), 0),
+        "RSI 14": round(float(latest["RSI_14"]), 2),
+        "Previous Completed Month R1": round(float(latest["Monthly_R1"]), 2),
+        "Close - Monthly R1": round(
+            float(latest["Close"] - latest["Monthly_R1"]), 2
+        ),
+        "High > Previous High": bool(latest["High_Above_Prior_High"]),
+        "Close > Open": bool(latest["Bullish_Candle"]),
+        "Close > EMA 20": bool(latest["Close_Above_EMA20"]),
+        "Close > EMA 50": bool(latest["Close_Above_EMA50"]),
+        "Change > 2%": bool(latest["Change_Above_2_Percent"]),
+        "Volume > SMA 5": bool(latest["Volume_Above_SMA5"]),
+        "RSI > 65": bool(latest["RSI_Above_65"]),
+        "Close > Monthly R1": bool(latest["Close_Above_Monthly_R1"]),
+        "Previous Close <= Monthly R1": bool(
+            latest["Prior_Close_Below_Monthly_R1"]
+        ),
         "Signal": "BUY" if bool(latest["BUY_SIGNAL"]) else "WAIT",
     }
 
@@ -184,10 +222,11 @@ def download_market_data(symbols: tuple[str, ...]) -> dict[str, pd.DataFrame]:
     for start in range(0, len(symbols), batch_size):
         batch = list(symbols[start:start + batch_size])
         tickers = [f"{symbol}.NS" for symbol in batch]
+
         try:
             data = yf.download(
                 tickers=tickers,
-                period="1y",
+                period="2y",
                 interval="1d",
                 auto_adjust=True,
                 group_by="ticker",
@@ -230,15 +269,19 @@ with st.sidebar:
     upload = st.file_uploader("Optional custom symbols CSV", type=["csv"])
     st.caption("CSV must contain a column named Symbol, e.g. RELIANCE.")
     st.divider()
-    st.markdown("**Pivot configuration**")
-    st.write("Type: Traditional / Classic")
-    st.write("Timeframe: DAILY (explicit, not Auto)")
-    st.write("R1 = 2 × Daily Pivot − Previous Day Low")
-    st.divider()
     st.markdown("**BUY conditions**")
-    st.write("1. CCI(14) crosses above 200")
-    st.write("2. Close crosses above the daily R1 series")
-    st.write("3. Daily change is 0% to +3%")
+    st.write("1. Daily High > previous day's High")
+    st.write("2. Daily Close > Daily Open")
+    st.write("3. Daily Close > EMA 20 and EMA 50")
+    st.write("4. Daily change > 2%")
+    st.write("5. Daily Volume > Volume SMA 5")
+    st.write("6. Daily RSI 14 > 65")
+    st.write("7. Daily Close > previous completed month's R1")
+    st.write("8. Previous day's Close <= that month's R1")
+    st.caption(
+        "Monthly R1 = 2 × ((Previous Month H + L + C) / 3) "
+        "− Previous Month Low"
+    )
 
 
 if upload is not None:
@@ -263,6 +306,8 @@ else:
         st.error(f"Unable to fetch {universe} constituents: {exc}")
         st.info("Try again later or upload a CSV containing a Symbol column.")
         st.stop()
+
+symbols = [s for s in symbols if s and s.lower() != "nan"]
 
 top1, top2 = st.columns([2, 1])
 top1.write(f"**Universe:** {source}  |  **Symbols:** {len(symbols)}")
@@ -298,6 +343,7 @@ if st.button("RUN EOD SCANNER", type="primary", use_container_width=True):
                     rows.append(result)
             except Exception:
                 failed.append(symbol)
+
         progress.progress(i / total)
         status.text(f"Analyzing {symbol} ({i}/{total})")
 
@@ -306,7 +352,7 @@ if st.button("RUN EOD SCANNER", type="primary", use_container_width=True):
 
     if rows:
         results = pd.DataFrame(rows).sort_values(
-            ["Signal", "CCI 14"], ascending=[True, False]
+            ["Signal", "RSI 14"], ascending=[True, False]
         ).reset_index(drop=True)
         buys = results[results["Signal"] == "BUY"].copy()
         st.session_state["results"] = results
@@ -331,15 +377,15 @@ if "results" in st.session_state:
     b.metric("BUY candidates", len(buys))
     c.metric("Missing / failed", len(failed))
 
-    st.subheader("BUY watchlist for next trading session")
+    st.subheader("BUY watchlist")
     if buys.empty:
-        st.info("No stocks met all three conditions.")
+        st.info("No stocks met all nine conditions.")
     else:
         st.dataframe(buys, use_container_width=True, hide_index=True)
         st.download_button(
             "Download BUY watchlist CSV",
             data=buys.to_csv(index=False).encode("utf-8"),
-            file_name="NSE_EOD_CCI_Daily_R1_BUY.csv",
+            file_name="NSE_EOD_Monthly_R1_BUY.csv",
             mime="text/csv",
         )
 
@@ -348,23 +394,39 @@ if "results" in st.session_state:
     st.download_button(
         "Download full scan CSV",
         data=results.to_csv(index=False).encode("utf-8"),
-        file_name="NSE_EOD_CCI_Daily_R1_Full.csv",
+        file_name="NSE_EOD_Monthly_R1_Full.csv",
         mime="text/csv",
     )
 
     st.subheader("Condition-by-condition validation")
     chosen = st.selectbox("Select stock", results["Symbol"].tolist())
     row = results.loc[results["Symbol"] == chosen].iloc[0]
-    x, y, z = st.columns(3)
-    x.metric("CCI crossed above 200", "PASS" if row["CCI Cross Above 200"] else "FAIL")
-    y.metric("Close crossed above daily R1", "PASS" if row["Close Cross Above Daily R1"] else "FAIL")
-    z.metric("Daily change 0% to +3%", "PASS" if row["Change 0% to 3%"] else "FAIL")
+
+    condition_names = [
+        "High > Previous High",
+        "Close > Open",
+        "Close > EMA 20",
+        "Close > EMA 50",
+        "Change > 2%",
+        "Volume > SMA 5",
+        "RSI > 65",
+        "Close > Monthly R1",
+        "Previous Close <= Monthly R1",
+    ]
+    cols = st.columns(3)
+    for i, condition in enumerate(condition_names):
+        cols[i % 3].metric(
+            condition,
+            "PASS" if bool(row[condition]) else "FAIL",
+        )
 
     st.write(f"**Signal: {row['Signal']}**")
     st.caption(
-        "Check the displayed candle date and daily OHLC values. "
-        "Data is sourced from Yahoo Finance and may be delayed, missing, "
-        "or different from TradingView's adjustment/session settings. "
+        "Monthly R1 uses the previous completed calendar month's H/L/C and "
+        "is held constant throughout the current month. The previous day's "
+        "close is compared with the same current-month R1. Data is sourced "
+        "from Yahoo Finance, may be delayed or missing, and uses auto-adjusted "
+        "prices. Verify signals against your chart/data provider before trading. "
         "This is a research scanner, not an execution recommendation."
     )
 
